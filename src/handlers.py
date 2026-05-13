@@ -73,7 +73,6 @@ def build_router(service: BotService) -> Router:
 
         locale = await service.get_locale(message.from_user.id)
         if not service.is_admin(message.from_user.id):
-            await message.answer(translate(locale, "admin_only"))
             return
 
         if not command.args:
@@ -100,7 +99,6 @@ def build_router(service: BotService) -> Router:
         locale = await service.get_locale(message.from_user.id)
         candidate = message.text.strip()
         if not EMAIL_REGEX.fullmatch(candidate):
-            await message.answer(translate(locale, "unknown_text"))
             return
 
         status = await service.start_code_request(
@@ -127,8 +125,6 @@ def build_router(service: BotService) -> Router:
                 )
             )
             return
-
-        await message.answer(translate(locale, "email_invalid"))
 
     return router
 
