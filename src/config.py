@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     mail_poll_interval_min_seconds: float = 7.0
     mail_poll_interval_max_seconds: float = 10.0
     mail_reconnect_delay_seconds: float = 10.0
+    mail_global_rate_limit_per_second: float = 2.0
+    mail_global_backoff_base_seconds: float = 5.0
+    mail_global_backoff_max_seconds: float = 120.0
 
     @field_validator("tg_admins", mode="before")
     @classmethod

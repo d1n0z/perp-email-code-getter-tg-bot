@@ -3,6 +3,7 @@ import imaplib
 import json
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,60 @@ class CodeWaitTimeout(RuntimeError):
 class CodeResult:
     code: str
     folder: str
+
+
+class GlobalMailRequestLimiter:
+    def __init__(
+        self,
+        *,
+        rate_limit_per_second: float,
+        backoff_base_seconds: float,
+        backoff_max_seconds: float,
+    ) -> None:
+        if rate_limit_per_second <= 0:
+            raise ValueError("rate_limit_per_second must be positive")
+
+        self.min_interval_seconds = 1.0 / rate_limit_per_second
+        self.backoff_base_seconds = max(backoff_base_seconds, self.min_interval_seconds)
+        self.backoff_max_seconds = max(
+            backoff_max_seconds,
+            self.backoff_base_seconds,
+        )
+        self._condition = threading.Condition()
+        self._next_request_at = 0.0
+        self._backoff_until = 0.0
+        self._consecutive_failures = 0
+
+    def wait_for_slot(self) -> None:
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                allowed_at = max(self._next_request_at, self._backoff_until)
+                wait_seconds = allowed_at - now
+                if wait_seconds <= 0:
+                    self._next_request_at = now + self.min_interval_seconds
+                    return
+                self._condition.wait(timeout=wait_seconds)
+
+    def record_success(self) -> None:
+        with self._condition:
+            self._consecutive_failures = 0
+            if self._backoff_until <= time.monotonic():
+                self._backoff_until = 0.0
+            self._condition.notify_all()
+
+    def record_failure(self) -> None:
+        with self._condition:
+            self._consecutive_failures += 1
+            backoff_seconds = min(
+                self.backoff_max_seconds,
+                self.backoff_base_seconds * (2 ** (self._consecutive_failures - 1)),
+            )
+            self._backoff_until = max(
+                self._backoff_until,
+                time.monotonic() + backoff_seconds,
+            )
+            self._condition.notify_all()
 
 
 class TokenManager:
@@ -84,6 +139,11 @@ class EmailCodeFetcher:
         self.poll_interval_min_seconds = settings.mail_poll_interval_min_seconds
         self.poll_interval_max_seconds = settings.mail_poll_interval_max_seconds
         self.reconnect_delay_seconds = settings.mail_reconnect_delay_seconds
+        self.limiter = GlobalMailRequestLimiter(
+            rate_limit_per_second=settings.mail_global_rate_limit_per_second,
+            backoff_base_seconds=settings.mail_global_backoff_base_seconds,
+            backoff_max_seconds=settings.mail_global_backoff_max_seconds,
+        )
 
     def wait_for_code(self, account: EmailAccount) -> CodeResult:
         deadline = time.monotonic() + self.wait_timeout_seconds
@@ -135,8 +195,14 @@ class EmailCodeFetcher:
             raise RuntimeError("Failed to acquire Outlook access token")
 
         auth_string = f"user={email_address}\1auth=Bearer {access_token}\1\1"
-        imap = imaplib.IMAP4_SSL(self.imap_host)
-        imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
+        imap = self._run_limited_imap_call(
+            lambda: imaplib.IMAP4_SSL(self.imap_host),
+            command_name="connect",
+        )
+        self._run_limited_imap_call(
+            lambda: imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8")),
+            command_name="authenticate",
+        )
         return imap
 
     def _get_recent_code(
@@ -197,11 +263,11 @@ class EmailCodeFetcher:
         imap: imaplib.IMAP4_SSL,
         folder: str,
     ) -> str | None:
-        status, _ = imap.select(folder)
+        status, _ = self._imap_select(imap, folder)
         if status != "OK":
             return None
 
-        status, data = imap.uid("search", f'FROM "{self.search_from}"')
+        status, data = self._imap_uid(imap, "search", f'FROM "{self.search_from}"')
         if status != "OK" or not data or not data[0]:
             return None
 
@@ -214,11 +280,11 @@ class EmailCodeFetcher:
         folder: str,
         uid: str,
     ) -> Message | None:
-        status, _ = imap.select(folder)
+        status, _ = self._imap_select(imap, folder)
         if status != "OK":
             return None
 
-        status, data = imap.uid("fetch", uid, "(RFC822)")
+        status, data = self._imap_uid(imap, "fetch", uid, "(RFC822)")
         if status != "OK" or not data or not data[0]:
             return None
 
@@ -284,6 +350,102 @@ class EmailCodeFetcher:
         if imap is None:
             return
         try:
-            imap.logout()
+            self._run_limited_imap_call(imap.logout, command_name="logout")
         except Exception:
             pass
+
+    def _imap_select(
+        self,
+        imap: imaplib.IMAP4_SSL,
+        folder: str,
+    ):
+        return self._run_limited_imap_call(
+            lambda: imap.select(folder),
+            command_name="select",
+        )
+
+    def _imap_uid(
+        self,
+        imap: imaplib.IMAP4_SSL,
+        command: str,
+        *args: str,
+    ):
+        return self._run_limited_imap_call(
+            lambda: imap.uid(command, *args),
+            command_name=f"uid_{command.lower()}",
+        )
+
+    def _run_limited_imap_call(self, operation, *, command_name: str):
+        self.limiter.wait_for_slot()
+        try:
+            result = operation()
+        except Exception as exc:
+            if self._should_apply_global_backoff(exc, command_name):
+                self.limiter.record_failure()
+            raise
+        else:
+            if self._should_apply_global_backoff_from_response(result):
+                self.limiter.record_failure()
+            else:
+                self.limiter.record_success()
+            return result
+
+    def _should_apply_global_backoff_from_response(self, result: object) -> bool:
+        if not isinstance(result, tuple) or not result:
+            return False
+
+        status = result[0]
+        if not isinstance(status, str) or status == "OK":
+            return False
+
+        response_chunks: list[str] = []
+        if len(result) > 1 and isinstance(result[1], list):
+            for item in result[1]:
+                if isinstance(item, bytes):
+                    response_chunks.append(item.decode("utf-8", errors="ignore"))
+                elif isinstance(item, str):
+                    response_chunks.append(item)
+
+        lowered_message = " ".join(response_chunks).lower()
+        transient_markers = (
+            "rate",
+            "limit",
+            "throttl",
+            "tempor",
+            "timeout",
+            "try again",
+            "too many",
+            "unavailable",
+            "server error",
+            "connection closed",
+        )
+        return any(marker in lowered_message for marker in transient_markers)
+
+    def _should_apply_global_backoff(
+        self,
+        error: Exception,
+        command_name: str,
+    ) -> bool:
+        if isinstance(error, (imaplib.IMAP4.abort, TimeoutError, OSError)):
+            return True
+
+        if not isinstance(error, imaplib.IMAP4.error):
+            return False
+
+        lowered_message = str(error).lower()
+        transient_markers = (
+            "rate",
+            "limit",
+            "throttl",
+            "tempor",
+            "timeout",
+            "try again",
+            "too many",
+            "unavailable",
+            "server error",
+            "connection closed",
+        )
+        if any(marker in lowered_message for marker in transient_markers):
+            return True
+
+        return command_name in {"connect", "authenticate"} and "auth" not in lowered_message
