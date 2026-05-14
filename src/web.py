@@ -18,7 +18,7 @@ WEB_USER_COOKIE_NAME = "perp_web_user_id"
 WEB_TEXTS = {
     "ru": {
         "title": "Perp Mail Bot",
-        "subtitle": "Это тот же backend проекта, только с простым web-интерфейсом.",
+        "subtitle": "",
         "request_heading": "Получить код",
         "request_label": "Email",
         "request_placeholder": "example@outlook.com",
@@ -29,7 +29,7 @@ WEB_TEXTS = {
     },
     "en": {
         "title": "Perp Mail Bot",
-        "subtitle": "This is the same project backend, just with a simple web interface.",
+        "subtitle": "",
         "request_heading": "Get code",
         "request_label": "Email",
         "request_placeholder": "example@outlook.com",
