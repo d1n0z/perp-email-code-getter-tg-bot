@@ -61,7 +61,7 @@ def create_web_app(service: BotService) -> FastAPI:
             base_path=base_path,
         )
 
-    async def request_code(request: Request) -> RedirectResponse | HTMLResponse:
+    async def request_code(request: Request):
         payload = await read_form_body(request)
         locale = resolve_locale(payload.get("lang"))
         email_address = normalize_email(payload.get("email", ""))
@@ -234,22 +234,36 @@ def create_web_app(service: BotService) -> FastAPI:
         return response
 
     for route_path in route_variants("/", base_path):
-        app.add_api_route(route_path, index, methods=["GET"], response_class=HTMLResponse)
+        app.add_api_route(
+            route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
     for route_path in route_variants("/request-code", base_path):
         app.add_api_route(
             route_path,
             request_code,
             methods=["POST"],
             response_class=HTMLResponse,
+            response_model=None,
         )
     for route_path in route_variants("/wait", base_path):
-        app.add_api_route(route_path, wait_page, methods=["GET"], response_class=HTMLResponse)
+        app.add_api_route(
+            route_path,
+            wait_page,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
     for route_path in route_variants("/request-status", base_path):
         app.add_api_route(
             route_path,
             request_status,
             methods=["GET"],
             response_class=JSONResponse,
+            response_model=None,
         )
 
     return app
