@@ -114,11 +114,10 @@ def build_router(service: BotService) -> Router:
         if status == "missing":
             await message.answer(translate(locale, "email_missing"))
             return
-        # if status == "taken":
-        #     await message.answer(translate(locale, "email_taken"))
-        #     return
-        # if status == "started":
-        if status == "started" or status == "taken":
+        if status == "taken":
+            await message.answer(translate(locale, "email_taken"))
+            return
+        if status == "started":
             await message.answer(
                 translate(
                     locale,

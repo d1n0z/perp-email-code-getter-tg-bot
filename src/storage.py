@@ -130,12 +130,6 @@ class JsonStorage:
             now = datetime.now(timezone.utc).isoformat()
 
             if normalized_record is not None:
-                existing_owner_id = str(normalized_record["owner_id"])
-                if existing_owner_id != owner_id:
-                    data[normalized_email] = normalized_record
-                    self._write_json(self.taken_email_store_path, data)
-                    return False
-
                 created_at = str(normalized_record.get("created_at") or now)
                 request_count_raw = normalized_record.get("request_count", 1)
                 request_count = (
@@ -147,6 +141,9 @@ class JsonStorage:
                 created_at = now
                 request_count = 0
 
+            # Temporary behavior: keep email_taken.json as a usage log only.
+            # We still write requester metadata and counters, but do not block
+            # requests based on the previous owner yet.
             data[normalized_email] = {
                 "owner_id": owner_id,
                 "owner_kind": owner_kind,
