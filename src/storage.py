@@ -9,8 +9,19 @@ from typing import Any
 from uuid import UUID
 
 
+class JsonStorageCorruptionError(RuntimeError):
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"JSON store '{path}' is corrupted: {reason}")
+
+
 def normalize_email(value: str) -> str:
     return value.strip().lower()
+
+
+def normalize_key_code(value: str) -> str:
+    return value.strip().upper()
 
 
 def _looks_like_uuid(value: str) -> bool:
@@ -19,6 +30,20 @@ def _looks_like_uuid(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _parse_datetime(raw_value: Any) -> datetime:
+    if isinstance(raw_value, datetime):
+        parsed = raw_value
+    else:
+        text = str(raw_value or "").strip()
+        if not text:
+            return datetime.now(timezone.utc)
+        parsed = datetime.fromisoformat(text)
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(slots=True, frozen=True)
@@ -81,23 +106,136 @@ class EmailAccount:
         return asdict(self)
 
 
+@dataclass(slots=True, frozen=True)
+class SubscriptionKey:
+    code: str
+    email_address: str
+    duration_days: int
+    created_at: datetime
+    expires_at: datetime
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SubscriptionKey":
+        return cls(
+            code=normalize_key_code(str(data["code"])),
+            email_address=normalize_email(str(data["email_address"])),
+            duration_days=int(data["duration_days"]),
+            created_at=_parse_datetime(data["created_at"]),
+            expires_at=_parse_datetime(data["expires_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "email_address": self.email_address,
+            "duration_days": self.duration_days,
+            "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
+            "expires_at": self.expires_at.astimezone(timezone.utc).isoformat(),
+        }
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        reference = now or datetime.now(timezone.utc)
+        return reference >= self.expires_at
+
+
+@dataclass(slots=True, frozen=True)
+class UserKeyActivation:
+    requester_id: str
+    user_id: int
+    chat_id: int
+    username: str | None
+    full_name: str | None
+    code: str
+    activated_at: datetime
+    last_used_at: datetime
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UserKeyActivation":
+        return cls(
+            requester_id=str(data["requester_id"]),
+            user_id=int(data["user_id"]),
+            chat_id=int(data["chat_id"]),
+            username=data.get("username"),
+            full_name=data.get("full_name"),
+            code=normalize_key_code(str(data["code"])),
+            activated_at=_parse_datetime(data["activated_at"]),
+            last_used_at=_parse_datetime(data.get("last_used_at") or data["activated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requester_id": self.requester_id,
+            "user_id": self.user_id,
+            "chat_id": self.chat_id,
+            "username": self.username,
+            "full_name": self.full_name,
+            "code": self.code,
+            "activated_at": self.activated_at.astimezone(timezone.utc).isoformat(),
+            "last_used_at": self.last_used_at.astimezone(timezone.utc).isoformat(),
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class LegacyUser:
+    requester_id: str
+    user_id: int
+    chat_id: int | None
+    username: str | None
+    full_name: str | None
+    source_email: str
+    captured_at: datetime
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LegacyUser":
+        return cls(
+            requester_id=str(data["requester_id"]),
+            user_id=int(data["user_id"]),
+            chat_id=int(data["chat_id"]) if data.get("chat_id") is not None else None,
+            username=data.get("username"),
+            full_name=data.get("full_name"),
+            source_email=normalize_email(str(data.get("source_email") or "")),
+            captured_at=_parse_datetime(data["captured_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requester_id": self.requester_id,
+            "user_id": self.user_id,
+            "chat_id": self.chat_id,
+            "username": self.username,
+            "full_name": self.full_name,
+            "source_email": self.source_email,
+            "captured_at": self.captured_at.astimezone(timezone.utc).isoformat(),
+        }
+
+
 class JsonStorage:
     def __init__(
         self,
+        *,
         email_store_path: Path,
         taken_email_store_path: Path,
+        subscription_key_store_path: Path,
+        activated_key_store_path: Path,
+        legacy_user_store_path: Path,
         user_locale_store_path: Path,
     ) -> None:
         self.email_store_path = email_store_path
         self.taken_email_store_path = taken_email_store_path
+        self.subscription_key_store_path = subscription_key_store_path
+        self.activated_key_store_path = activated_key_store_path
+        self.legacy_user_store_path = legacy_user_store_path
         self.user_locale_store_path = user_locale_store_path
         self._email_lock = asyncio.Lock()
         self._taken_lock = asyncio.Lock()
+        self._key_lock = asyncio.Lock()
+        self._activation_lock = asyncio.Lock()
+        self._legacy_lock = asyncio.Lock()
         self._locale_lock = asyncio.Lock()
 
     async def upsert_account(self, account: EmailAccount) -> bool:
         async with self._email_lock:
-            data = self._load_json(self.email_store_path, default={})
+            data = self._load_json(self.email_store_path, default={}, strict=True)
             existed = account.login_email in data
             data[account.login_email] = account.to_dict()
             self._write_json(self.email_store_path, data)
@@ -125,7 +263,7 @@ class JsonStorage:
     ) -> bool:
         normalized_email = normalize_email(email_address)
         async with self._taken_lock:
-            data = self._load_json(self.taken_email_store_path, default={})
+            data = self._load_json(self.taken_email_store_path, default={}, strict=True)
             normalized_record = self._normalize_taken_record(data.get(normalized_email))
             now = datetime.now(timezone.utc).isoformat()
 
@@ -141,9 +279,8 @@ class JsonStorage:
                 created_at = now
                 request_count = 0
 
-            # Temporary behavior: keep email_taken.json as a usage log only.
-            # We still write requester metadata and counters, but do not block
-            # requests based on the previous owner yet.
+            # Legacy flow only: email_taken.json remains a usage log for
+            # users that already worked through the old email-based scheme.
             data[normalized_email] = {
                 "owner_id": owner_id,
                 "owner_kind": owner_kind,
@@ -158,6 +295,182 @@ class JsonStorage:
             self._write_json(self.taken_email_store_path, data)
             return True
 
+    async def add_subscription_keys(self, keys: list[SubscriptionKey]) -> None:
+        if not keys:
+            return
+
+        async with self._key_lock:
+            data = self._load_json(self.subscription_key_store_path, default={}, strict=True)
+            for key in keys:
+                data[key.code] = key.to_dict()
+            self._write_json(self.subscription_key_store_path, data)
+
+    async def get_subscription_key(self, code: str) -> SubscriptionKey | None:
+        normalized_code = normalize_key_code(code)
+        async with self._key_lock:
+            data = self._load_json(self.subscription_key_store_path, default={})
+            key_data = data.get(normalized_code)
+            if not isinstance(key_data, dict):
+                return None
+            return SubscriptionKey.from_dict(key_data)
+
+    async def list_subscription_keys(self) -> list[SubscriptionKey]:
+        async with self._key_lock:
+            data = self._load_json(self.subscription_key_store_path, default={})
+
+        keys: list[SubscriptionKey] = []
+        for raw_value in data.values():
+            if not isinstance(raw_value, dict):
+                continue
+            try:
+                keys.append(SubscriptionKey.from_dict(raw_value))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        return sorted(keys, key=lambda item: (item.is_expired(), item.expires_at, item.code))
+
+    async def delete_subscription_key(self, code: str) -> bool:
+        normalized_code = normalize_key_code(code)
+        async with self._key_lock, self._activation_lock:
+            keys_data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+            removed = keys_data.pop(normalized_code, None)
+            if removed is None:
+                return False
+
+            activation_data = self._load_json(
+                self.activated_key_store_path,
+                default={},
+                strict=True,
+            )
+            filtered_activation_data = {
+                requester_id: record
+                for requester_id, record in activation_data.items()
+                if not isinstance(record, dict)
+                or normalize_key_code(str(record.get("code") or "")) != normalized_code
+            }
+
+            self._write_json(self.subscription_key_store_path, keys_data)
+            self._write_json(self.activated_key_store_path, filtered_activation_data)
+            return True
+
+    async def activate_subscription_key(
+        self,
+        *,
+        requester_id: str,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        full_name: str | None,
+        code: str,
+    ) -> UserKeyActivation:
+        activation = UserKeyActivation(
+            requester_id=requester_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            code=normalize_key_code(code),
+            activated_at=datetime.now(timezone.utc),
+            last_used_at=datetime.now(timezone.utc),
+        )
+        async with self._activation_lock:
+            data = self._load_json(
+                self.activated_key_store_path,
+                default={},
+                strict=True,
+            )
+            # Persist bindings per requester so a single subscription key can
+            # stay active for any number of users at the same time.
+            data[requester_id] = activation.to_dict()
+            self._write_json(self.activated_key_store_path, data)
+        return activation
+
+    async def get_user_activation(self, requester_id: str) -> UserKeyActivation | None:
+        async with self._activation_lock:
+            data = self._load_json(self.activated_key_store_path, default={})
+            activation_data = data.get(requester_id)
+            if not isinstance(activation_data, dict):
+                return None
+            return UserKeyActivation.from_dict(activation_data)
+
+    async def clear_user_activation(self, requester_id: str) -> bool:
+        async with self._activation_lock:
+            data = self._load_json(
+                self.activated_key_store_path,
+                default={},
+                strict=True,
+            )
+            removed = data.pop(requester_id, None)
+            if removed is None:
+                return False
+            self._write_json(self.activated_key_store_path, data)
+            return True
+
+    async def sync_legacy_users_from_taken(self) -> None:
+        async with self._taken_lock, self._legacy_lock:
+            taken_data = self._load_json(self.taken_email_store_path, default={})
+            legacy_data = self._load_json(
+                self.legacy_user_store_path,
+                default={},
+                strict=True,
+            )
+            updated = False
+
+            for email_address, raw_record in taken_data.items():
+                normalized_record = self._normalize_taken_record(raw_record)
+                if normalized_record is None:
+                    continue
+
+                if str(normalized_record.get("owner_kind")) != "telegram":
+                    continue
+
+                requester_id = str(normalized_record.get("owner_id") or "").strip()
+                if not requester_id:
+                    continue
+                if requester_id in legacy_data:
+                    continue
+
+                user_id = normalized_record.get("user_id")
+                if not isinstance(user_id, int) or user_id <= 0:
+                    if requester_id.startswith("tg:") and requester_id[3:].isdigit():
+                        user_id = int(requester_id[3:])
+                    else:
+                        continue
+
+                legacy_user = LegacyUser(
+                    requester_id=requester_id,
+                    user_id=user_id,
+                    chat_id=normalized_record.get("chat_id")
+                    if isinstance(normalized_record.get("chat_id"), int)
+                    else None,
+                    username=normalized_record.get("username")
+                    if isinstance(normalized_record.get("username"), str)
+                    else None,
+                    full_name=normalized_record.get("full_name")
+                    if isinstance(normalized_record.get("full_name"), str)
+                    else None,
+                    source_email=normalize_email(str(email_address)),
+                    captured_at=_parse_datetime(
+                        normalized_record.get("created_at")
+                        or normalized_record.get("last_used_at")
+                    ),
+                )
+                legacy_data[requester_id] = legacy_user.to_dict()
+                updated = True
+
+            if updated:
+                self._write_json(self.legacy_user_store_path, legacy_data)
+
+    async def is_legacy_requester(self, requester_id: str) -> bool:
+        await self.sync_legacy_users_from_taken()
+        async with self._legacy_lock:
+            data = self._load_json(self.legacy_user_store_path, default={})
+            return requester_id in data
+
     async def get_locale(self, user_id: int, default_locale: str = "ru") -> str:
         async with self._locale_lock:
             data = self._load_json(self.user_locale_store_path, default={})
@@ -166,28 +479,43 @@ class JsonStorage:
                 return default_locale
             return locale
 
-    async def set_locale(self, user_id: int, locale: str) -> None:
+    async def has_locale(self, user_id: int) -> bool:
         async with self._locale_lock:
             data = self._load_json(self.user_locale_store_path, default={})
+            locale = data.get(str(user_id))
+            return locale in {"ru", "en"}
+
+    async def set_locale(self, user_id: int, locale: str) -> None:
+        async with self._locale_lock:
+            data = self._load_json(self.user_locale_store_path, default={}, strict=True)
             data[str(user_id)] = locale
             self._write_json(self.user_locale_store_path, data)
 
-    def _load_json(self, path: Path, *, default: Any) -> Any:
+    def _load_json(self, path: Path, *, default: Any, strict: bool = False) -> Any:
         if not path.exists():
             return default
 
         raw_content = path.read_text(encoding="utf-8").strip()
         if not raw_content:
+            # Fresh deployments often keep placeholder JSON files checked in as
+            # zero-byte files. Treat them as empty stores; strict mode only
+            # rejects malformed non-empty content.
             return default
 
         try:
             data = json.loads(raw_content)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            if strict:
+                raise JsonStorageCorruptionError(path, str(exc)) from exc
             return default
 
         if isinstance(default, dict) and not isinstance(data, dict):
+            if strict:
+                raise JsonStorageCorruptionError(path, "expected a JSON object")
             return default
         if isinstance(default, list) and not isinstance(data, list):
+            if strict:
+                raise JsonStorageCorruptionError(path, "expected a JSON array")
             return default
         return data
 

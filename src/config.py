@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     mail_folders: list[str] = ["INBOX", "Junk", "Junk Email"]
     email_store_path: Path = Path("email.json")
     taken_email_store_path: Path = Path("email_taken.json")
+    subscription_key_store_path: Path = Path("keys.json")
+    activated_key_store_path: Path = Path("activated_keys.json")
+    legacy_user_store_path: Path = Path("legacy_users.json")
     user_locale_store_path: Path = Path("user_locales.json")
     concurrent_mail_workers: int = 20
     mail_wait_timeout_seconds: int = 600

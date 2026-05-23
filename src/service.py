@@ -1,9 +1,12 @@
 import asyncio
 import contextlib
 import json
+import secrets
+import string
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from time import monotonic
 from uuid import uuid4
 
@@ -18,7 +21,14 @@ from src.microsoft_device_flow import (
     MicrosoftDeviceFlowError,
 )
 from src.messages import DEFAULT_LOCALE
-from src.storage import EmailAccount, JsonStorage, normalize_email
+from src.storage import (
+    EmailAccount,
+    JsonStorage,
+    SubscriptionKey,
+    UserKeyActivation,
+    normalize_email,
+    normalize_key_code,
+)
 
 
 @dataclass(slots=True)
@@ -34,6 +44,13 @@ class WebCodeRequest:
 class RefreshPromptState:
     user_id: int
     created_at: float
+
+
+@dataclass(slots=True)
+class ActivatedSubscription:
+    activation: UserKeyActivation
+    key: SubscriptionKey
+    account: EmailAccount | None
 
 
 class BotService:
@@ -54,6 +71,8 @@ class BotService:
         self._refresh_prompts: dict[int, RefreshPromptState] = {}
         self._active_refresh_tasks: dict[int, asyncio.Task[None]] = {}
         self._refresh_prompt_timeout_seconds = 15 * 60
+        self._subscription_code_lock = asyncio.Lock()
+        self._active_subscription_code_tasks: dict[str, asyncio.Task[None]] = {}
 
     def is_admin(self, user_id: int) -> bool:
         if not self.settings.tg_admins:
@@ -66,10 +85,184 @@ class BotService:
     async def set_locale(self, user_id: int, locale: str) -> None:
         await self.storage.set_locale(user_id, locale)
 
+    async def has_locale(self, user_id: int) -> bool:
+        return await self.storage.has_locale(user_id)
+
+    async def is_legacy_user(self, user_id: int) -> bool:
+        return await self.storage.is_legacy_requester(f"tg:{user_id}")
+
     async def add_account(self, raw_value: str) -> tuple[EmailAccount, bool]:
         account = EmailAccount.from_add_string(raw_value)
         existed = await self.storage.upsert_account(account)
         return account, existed
+
+    async def add_subscription_keys(
+        self,
+        *,
+        count: int,
+        duration_days: int,
+        email_address: str,
+    ) -> tuple[str, list[SubscriptionKey] | None]:
+        normalized_email = normalize_email(email_address)
+        account = await self.storage.get_account(normalized_email)
+        if account is None:
+            return "email_missing", None
+
+        existing_codes = {item.code for item in await self.storage.list_subscription_keys()}
+        generated_codes: set[str] = set()
+        created_at = datetime.now(timezone.utc)
+        expires_on = created_at.date() + timedelta(days=duration_days)
+        expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+        keys: list[SubscriptionKey] = []
+
+        for _ in range(count):
+            code = self._generate_subscription_code(existing_codes | generated_codes)
+            generated_codes.add(code)
+            keys.append(
+                SubscriptionKey(
+                    code=code,
+                    email_address=normalized_email,
+                    duration_days=duration_days,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                )
+            )
+
+        await self.storage.add_subscription_keys(keys)
+        return "created", keys
+
+    async def delete_subscription_key(self, code: str) -> bool:
+        return await self.storage.delete_subscription_key(code)
+
+    async def list_subscription_keys(self) -> list[SubscriptionKey]:
+        return await self.storage.list_subscription_keys()
+
+    async def get_user_activation(self, user_id: int) -> UserKeyActivation | None:
+        return await self.storage.get_user_activation(f"tg:{user_id}")
+
+    async def get_activated_subscription(
+        self,
+        user_id: int,
+    ) -> ActivatedSubscription | None:
+        requester_id = f"tg:{user_id}"
+        activation = await self.storage.get_user_activation(requester_id)
+        if activation is None:
+            return None
+
+        key = await self.storage.get_subscription_key(activation.code)
+        if key is None:
+            return None
+
+        account = await self.storage.get_account(key.email_address)
+        return ActivatedSubscription(
+            activation=activation,
+            key=key,
+            account=account,
+        )
+
+    async def clear_subscription_activation(self, user_id: int) -> bool:
+        await self.cancel_subscription_code_request(user_id)
+        return await self.storage.clear_user_activation(f"tg:{user_id}")
+
+    async def cancel_subscription_code_request(self, user_id: int) -> bool:
+        requester_id = f"tg:{user_id}"
+        task_to_cancel: asyncio.Task[None] | None = None
+
+        async with self._subscription_code_lock:
+            active_task = self._active_subscription_code_tasks.pop(requester_id, None)
+            if active_task is None or active_task.done():
+                return False
+
+            active_task.cancel()
+            task_to_cancel = active_task
+
+        if task_to_cancel is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task_to_cancel
+            return True
+
+        return False
+
+    async def activate_subscription_code(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        full_name: str | None,
+        code: str,
+    ) -> tuple[str, ActivatedSubscription | SubscriptionKey | None]:
+        normalized_code = normalize_key_code(code)
+        key = await self.storage.get_subscription_key(normalized_code)
+        if key is None:
+            return "missing", None
+        if key.is_expired():
+            return "expired", key
+
+        account = await self.storage.get_account(key.email_address)
+        if account is None:
+            return "email_missing", key
+
+        # Activating a key never consumes it globally. We only remember which
+        # reusable key this requester chose for later "request code" actions.
+        activation = await self.storage.activate_subscription_key(
+            requester_id=f"tg:{user_id}",
+            user_id=user_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            code=normalized_code,
+        )
+        return (
+            "activated",
+            ActivatedSubscription(
+                activation=activation,
+                key=key,
+                account=account,
+            ),
+        )
+
+    async def start_activated_code_request(
+        self,
+        *,
+        bot: Bot,
+        user_id: int,
+        chat_id: int,
+    ) -> str:
+        requester_id = f"tg:{user_id}"
+        subscription = await self.get_activated_subscription(user_id)
+        if subscription is None:
+            return "inactive"
+        if subscription.key.is_expired():
+            await self.clear_subscription_activation(user_id)
+            return "expired"
+        if subscription.account is None:
+            return "email_missing"
+
+        async with self._subscription_code_lock:
+            active_task = self._active_subscription_code_tasks.get(requester_id)
+            if active_task is not None and not active_task.done():
+                return "running"
+
+            task = asyncio.create_task(
+                self._deliver_code(
+                    bot=bot,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    account=subscription.account,
+                )
+            )
+            self._active_subscription_code_tasks[requester_id] = task
+
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(
+            lambda done_task, active_requester_id=requester_id: self._drop_subscription_code_task(
+                active_requester_id,
+                done_task,
+            )
+        )
+        return "started"
 
     async def begin_refresh_prompt(self, user_id: int) -> None:
         async with self._refresh_lock:
@@ -279,6 +472,20 @@ class BotService:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def format_date(date_value: datetime) -> str:
+        return date_value.astimezone(timezone.utc).strftime("%d.%m.%Y")
+
+    def split_message(self, text: str, limit: int = 3900) -> list[str]:
+        return self._chunk_message(text, limit)
+
+    def _generate_subscription_code(self, used_codes: set[str]) -> str:
+        alphabet = string.ascii_uppercase + string.digits
+        while True:
+            code = "".join(secrets.choice(alphabet) for _ in range(15))
+            if code not in used_codes:
+                return code
 
     async def _run_refresh_token_request(
         self,
@@ -511,6 +718,15 @@ class BotService:
         current_task = self._active_refresh_tasks.get(user_id)
         if current_task is task:
             self._active_refresh_tasks.pop(user_id, None)
+
+    def _drop_subscription_code_task(
+        self,
+        requester_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        current_task = self._active_subscription_code_tasks.get(requester_id)
+        if current_task is task:
+            self._active_subscription_code_tasks.pop(requester_id, None)
 
     def _build_refresh_login_keyboard(
         self,

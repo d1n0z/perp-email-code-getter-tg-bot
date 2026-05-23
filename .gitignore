@@ -10,6 +10,9 @@ wheels/
 .env
 email.json
 email_taken.json
+keys.json
+activated_keys.json
+legacy_users.json
 user_locales.json
 
 # Virtual environments

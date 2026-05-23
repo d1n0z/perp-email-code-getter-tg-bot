@@ -11,7 +11,8 @@ from aiogram.types import (
 )
 
 from src.messages import SUPPORTED_LOCALES, translate
-from src.service import BotService
+from src.service import ActivatedSubscription, BotService
+from src.storage import SubscriptionKey, normalize_key_code
 
 
 EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
@@ -20,24 +21,68 @@ EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORE
 def build_router(service: BotService) -> Router:
     router = Router()
 
+    async def send_start_flow(message, *, user_id: int, locale: str) -> None:
+        if await service.is_legacy_user(user_id):
+            await message.answer(translate(locale, "legacy_start_text"))
+            await message.answer(translate(locale, "legacy_help_text"))
+            return
+
+        subscription = await service.get_activated_subscription(user_id)
+        if subscription is None:
+            await message.answer(translate(locale, "key_prompt"))
+            return
+
+        if subscription.key.is_expired():
+            await service.clear_subscription_activation(user_id)
+            await message.answer(
+                translate(
+                    locale,
+                    "key_expired",
+                    code=subscription.key.code,
+                    end_date=service.format_date(subscription.key.expires_at),
+                )
+            )
+            await message.answer(translate(locale, "key_prompt"))
+            return
+
+        if subscription.account is None:
+            await message.answer(
+                translate(
+                    locale,
+                    "key_email_missing",
+                    code=subscription.key.code,
+                )
+            )
+            await message.answer(translate(locale, "key_prompt"))
+            return
+
+        await message.answer(
+            render_subscription_details(locale, user_id, subscription, service),
+            reply_markup=subscription_keyboard(locale, user_id),
+        )
+
     @router.message(CommandStart())
     async def start_handler(message: Message, command: CommandObject) -> None:
         if message.from_user is None:
             return
 
         requested_locale = (command.args or "").strip().lower()
+        has_saved_locale = await service.has_locale(message.from_user.id)
         if requested_locale in SUPPORTED_LOCALES:
             await service.set_locale(message.from_user.id, requested_locale)
-            await message.answer(translate(requested_locale, "language_set"))
-            await message.answer(translate(requested_locale, "start_text"))
-            await message.answer(translate(requested_locale, "help_text"))
-            return
+            has_saved_locale = True
 
         locale = await service.get_locale(message.from_user.id)
-        await message.answer(
-            translate(locale, "choose_language"),
-            reply_markup=language_keyboard(),
-        )
+        if requested_locale in SUPPORTED_LOCALES:
+            await message.answer(translate(locale, "language_set"))
+        elif not has_saved_locale:
+            await message.answer(
+                translate(locale, "choose_language"),
+                reply_markup=language_keyboard(),
+            )
+            return
+
+        await send_start_flow(message, user_id=message.from_user.id, locale=locale)
 
     @router.callback_query(F.data.startswith("lang:"))
     async def language_callback_handler(callback: CallbackQuery) -> None:
@@ -53,9 +98,13 @@ def build_router(service: BotService) -> Router:
         await service.set_locale(callback.from_user.id, locale)
         if callback.message is not None:
             with suppress(Exception):
-                await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore
+                await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[arg-type]
             await callback.message.answer(translate(locale, "language_set"))
-            await callback.message.answer(translate(locale, "help_text"))
+            await send_start_flow(
+                callback.message,
+                user_id=callback.from_user.id,
+                locale=locale,
+            )
         await callback.answer()
 
     @router.callback_query(F.data.startswith("refresh_ack:"))
@@ -77,14 +126,14 @@ def build_router(service: BotService) -> Router:
             )
             return
 
-        if callback.message is not None and callback.message.reply_markup is not None:  # type: ignore
+        if callback.message is not None and callback.message.reply_markup is not None:  # type: ignore[truthy-bool]
             url_rows: list[list[InlineKeyboardButton]] = []
-            for row in callback.message.reply_markup.inline_keyboard:  # type: ignore
+            for row in callback.message.reply_markup.inline_keyboard:  # type: ignore[union-attr]
                 url_buttons = [button for button in row if button.url]
                 if url_buttons:
                     url_rows.append(url_buttons)
             with suppress(Exception):
-                await callback.message.edit_reply_markup(  # type: ignore
+                await callback.message.edit_reply_markup(  # type: ignore[arg-type]
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=url_rows)
                     if url_rows
                     else None
@@ -92,11 +141,111 @@ def build_router(service: BotService) -> Router:
 
         await callback.answer(translate(locale, "refresh_acknowledged"))
 
+    @router.callback_query(F.data.startswith("subscription:"))
+    async def subscription_callback_handler(callback: CallbackQuery) -> None:
+        if (
+            callback.from_user is None
+            or callback.data is None
+            or callback.message is None
+            or callback.bot is None
+        ):
+            await callback.answer()
+            return
+
+        locale = await service.get_locale(callback.from_user.id)
+        _, action, owner_id_raw = callback.data.split(":", 2)
+        if not owner_id_raw.isdigit():
+            await callback.answer()
+            return
+
+        if callback.from_user.id != int(owner_id_raw):
+            await callback.answer(
+                translate(locale, "subscription_access_denied"),
+                show_alert=True,
+            )
+            return
+
+        if action == "change":
+            await service.clear_subscription_activation(callback.from_user.id)
+            with suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[arg-type]
+            await callback.message.answer(translate(locale, "subscription_change_success"))
+            await callback.answer()
+            return
+
+        if action != "request":
+            await callback.answer()
+            return
+
+        subscription = await service.get_activated_subscription(callback.from_user.id)
+        if subscription is None:
+            await callback.message.answer(translate(locale, "subscription_inactive"))
+            await callback.answer()
+            return
+
+        if subscription.key.is_expired():
+            await service.clear_subscription_activation(callback.from_user.id)
+            await callback.message.answer(
+                translate(
+                    locale,
+                    "key_expired",
+                    code=subscription.key.code,
+                    end_date=service.format_date(subscription.key.expires_at),
+                )
+            )
+            await callback.message.answer(translate(locale, "key_prompt"))
+            await callback.answer()
+            return
+
+        if subscription.account is None:
+            await callback.message.answer(
+                translate(
+                    locale,
+                    "key_email_missing",
+                    code=subscription.key.code,
+                )
+            )
+            await callback.message.answer(translate(locale, "key_prompt"))
+            await callback.answer()
+            return
+
+        status = await service.start_activated_code_request(
+            bot=callback.bot,
+            user_id=callback.from_user.id,
+            chat_id=callback.message.chat.id,
+        )
+        if status == "running":
+            await callback.answer(
+                translate(locale, "subscription_request_running"),
+                show_alert=True,
+            )
+            return
+        if status == "inactive":
+            await callback.message.answer(translate(locale, "subscription_inactive"))
+            await callback.answer()
+            return
+        if status == "expired":
+            await callback.message.answer(translate(locale, "key_prompt"))
+            await callback.answer()
+            return
+        if status == "email_missing":
+            await callback.message.answer(
+                translate(locale, "key_email_missing", code=subscription.key.code)
+            )
+            await callback.answer()
+            return
+
+        await callback.message.answer(translate(locale, "subscription_request_started"))
+        await callback.answer()
+
     @router.message(Command("help"))
     async def help_handler(message: Message) -> None:
         if message.from_user is None:
             return
         locale = await service.get_locale(message.from_user.id)
+        if await service.is_legacy_user(message.from_user.id):
+            await message.answer(translate(locale, "legacy_help_text"))
+            return
         await message.answer(translate(locale, "help_text"))
 
     @router.message(Command("add"))
@@ -121,6 +270,108 @@ def build_router(service: BotService) -> Router:
 
         key = "add_updated" if existed else "add_success"
         await message.answer(translate(locale, key, email=account.login_email))
+
+    @router.message(Command("addkey"))
+    async def addkey_handler(message: Message, command: CommandObject) -> None:
+        if message.from_user is None:
+            return
+
+        locale = await service.get_locale(message.from_user.id)
+        if not service.is_admin(message.from_user.id):
+            await message.answer(translate(locale, "admin_only"))
+            return
+
+        args = (command.args or "").split()
+        if len(args) != 3:
+            await message.answer(translate(locale, "addkey_usage"))
+            return
+
+        count_raw, duration_raw, email_address = args
+        try:
+            count = int(count_raw)
+            duration_days = int(duration_raw)
+        except ValueError:
+            await message.answer(translate(locale, "addkey_invalid"))
+            return
+
+        if count <= 0 or duration_days <= 0:
+            await message.answer(translate(locale, "addkey_invalid"))
+            return
+
+        status, keys = await service.add_subscription_keys(
+            count=count,
+            duration_days=duration_days,
+            email_address=email_address,
+        )
+        if status == "email_missing" or not keys:
+            await message.answer(
+                translate(
+                    locale,
+                    "addkey_email_missing",
+                    email=email_address.strip().lower(),
+                )
+            )
+            return
+
+        codes_text = "\n".join(f"`{key.code}`" for key in keys)
+        text = translate(
+            locale,
+            "addkey_success",
+            count=str(len(keys)),
+            email=keys[0].email_address,
+            duration_days=str(keys[0].duration_days),
+            end_date=service.format_date(keys[0].expires_at),
+            codes=codes_text,
+        )
+        await send_chunks(message, service, text)
+
+    @router.message(Command("delkey"))
+    async def delkey_handler(message: Message, command: CommandObject) -> None:
+        if message.from_user is None:
+            return
+
+        locale = await service.get_locale(message.from_user.id)
+        if not service.is_admin(message.from_user.id):
+            await message.answer(translate(locale, "admin_only"))
+            return
+
+        raw_code = (command.args or "").strip()
+        if not raw_code:
+            await message.answer(translate(locale, "delkey_usage"))
+            return
+
+        code = normalize_key_code(raw_code)
+        deleted = await service.delete_subscription_key(code)
+        if not deleted:
+            await message.answer(translate(locale, "delkey_missing", code=code))
+            return
+
+        await message.answer(translate(locale, "delkey_success", code=code))
+
+    @router.message(Command("keylist"))
+    async def keylist_handler(message: Message) -> None:
+        if message.from_user is None:
+            return
+
+        locale = await service.get_locale(message.from_user.id)
+        if not service.is_admin(message.from_user.id):
+            await message.answer(translate(locale, "admin_only"))
+            return
+
+        keys = await service.list_subscription_keys()
+        if not keys:
+            await message.answer(translate(locale, "keylist_empty"))
+            return
+
+        rows = [
+            f"{'+' if not key.is_expired() else '-'} {key.code} {key.email_address}"
+            for key in keys
+        ]
+        await send_chunks(
+            message,
+            service,
+            translate(locale, "keylist_header", rows="\n".join(rows)),
+        )
 
     @router.message(Command("refresh"))
     async def refresh_handler(message: Message, command: CommandObject) -> None:
@@ -159,7 +410,7 @@ def build_router(service: BotService) -> Router:
         await message.answer(translate(locale, "refresh_prompt"))
 
     @router.message(F.text)
-    async def email_handler(message: Message) -> None:
+    async def text_handler(message: Message) -> None:
         if message.from_user is None or message.text is None:
             return
 
@@ -193,27 +444,29 @@ def build_router(service: BotService) -> Router:
                 )
                 return
 
-        if not EMAIL_REGEX.fullmatch(candidate):
-            return
+        if await service.is_legacy_user(message.from_user.id):
+            if not EMAIL_REGEX.fullmatch(candidate):
+                await message.answer(translate(locale, "legacy_unknown_text"))
+                return
 
-        status = await service.start_code_request(
-            bot=message.bot,
-            requester_id=f"tg:{message.from_user.id}",
-            requester_kind="telegram",
-            user_id=message.from_user.id,
-            chat_id=message.chat.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name,
-            email_address=candidate,
-        )
+            status = await service.start_code_request(
+                bot=message.bot,
+                requester_id=f"tg:{message.from_user.id}",
+                requester_kind="telegram",
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name,
+                email_address=candidate,
+            )
 
-        if status == "missing":
-            await message.answer(translate(locale, "email_missing"))
-            return
-        if status == "taken":
-            await message.answer(translate(locale, "email_taken"))
-            return
-        if status == "started":
+            if status == "missing":
+                await message.answer(translate(locale, "email_missing"))
+                return
+            if status == "taken":
+                await message.answer(translate(locale, "email_taken"))
+                return
+
             await message.answer(
                 translate(
                     locale,
@@ -222,6 +475,98 @@ def build_router(service: BotService) -> Router:
                 )
             )
             return
+
+        subscription = await service.get_activated_subscription(message.from_user.id)
+        if subscription is not None:
+            if subscription.key.is_expired():
+                await service.clear_subscription_activation(message.from_user.id)
+                await message.answer(
+                    translate(
+                        locale,
+                        "key_expired",
+                        code=subscription.key.code,
+                        end_date=service.format_date(subscription.key.expires_at),
+                    )
+                )
+                await message.answer(translate(locale, "key_prompt"))
+                return
+
+            if subscription.account is None:
+                await message.answer(
+                    translate(
+                        locale,
+                        "key_email_missing",
+                        code=subscription.key.code,
+                    )
+                )
+            else:
+                await message.answer(
+                    translate(locale, "subscription_already_active"),
+                    reply_markup=subscription_keyboard(locale, message.from_user.id),
+                )
+                await message.answer(
+                    render_subscription_details(
+                        locale,
+                        message.from_user.id,
+                        subscription,
+                        service,
+                    )
+                )
+                return
+
+        status, payload = await service.activate_subscription_code(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+            code=candidate,
+        )
+
+        if status == "missing":
+            await message.answer(
+                translate(
+                    locale,
+                    "key_invalid",
+                    code=normalize_key_code(candidate),
+                )
+            )
+            return
+
+        if status == "expired" and isinstance(payload, SubscriptionKey):
+            await message.answer(
+                translate(
+                    locale,
+                    "key_expired",
+                    code=payload.code,
+                    end_date=service.format_date(payload.expires_at),
+                )
+            )
+            await message.answer(translate(locale, "key_prompt"))
+            return
+
+        if status == "email_missing" and isinstance(payload, SubscriptionKey):
+            await message.answer(
+                translate(
+                    locale,
+                    "key_email_missing",
+                    code=payload.code,
+                )
+            )
+            return
+
+        if status == "activated" and isinstance(payload, ActivatedSubscription):
+            await message.answer(
+                render_subscription_details(
+                    locale,
+                    message.from_user.id,
+                    payload,
+                    service,
+                ),
+                reply_markup=subscription_keyboard(locale, message.from_user.id),
+            )
+            return
+
+        await message.answer(translate(locale, "key_prompt"))
 
     return router
 
@@ -235,3 +580,44 @@ def language_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def subscription_keyboard(locale: str, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=translate(locale, "subscription_request_button"),
+                    callback_data=f"subscription:request:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=translate(locale, "subscription_change_button"),
+                    callback_data=f"subscription:change:{user_id}",
+                )
+            ],
+        ]
+    )
+
+
+def render_subscription_details(
+    locale: str,
+    user_id: int,
+    subscription: ActivatedSubscription,
+    service: BotService,
+) -> str:
+    return translate(
+        locale,
+        "subscription_details",
+        user_id=str(user_id),
+        email=subscription.key.email_address,
+        duration_days=str(subscription.key.duration_days),
+        end_date=service.format_date(subscription.key.expires_at),
+        code=subscription.key.code,
+    )
+
+
+async def send_chunks(message: Message, service: BotService, text: str) -> None:
+    for chunk in service.split_message(text):
+        await message.answer(chunk)
